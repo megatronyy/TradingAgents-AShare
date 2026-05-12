@@ -2778,6 +2778,9 @@ async def _ai_extract_symbol_and_date_streaming(
     import json as _json
 
     today = datetime.now().strftime("%Y-%m-%d")
+    # 兜底：先用 regex 直接从原文抽 symbol/date，LLM 失败 / 限流 / 返回 null 时
+    # 至少不会把用户已经明确输入的代码也判为"无法识别"。
+    fast_symbol, fast_date = _extract_symbol_and_date(text)
     llm_name: Optional[str] = None
     llm_date: Optional[str] = None
     llm_horizons: List[str] = ["short"]
@@ -2845,20 +2848,29 @@ async def _ai_extract_symbol_and_date_streaming(
         _log(f"[StockExtract streaming] LLM failed: {e}")
 
     if not llm_name:
+        if fast_symbol:
+            _log(f"[StockExtract] LLM 未返回 stock_name，使用 regex 兜底: {fast_symbol}")
+            return fast_symbol, fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
         return None, None, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
     _log(f"[StockExtract] extracted name='{llm_name}', date={llm_date}, horizons={llm_horizons}")
-    if re.match(r"^\d{6}$", llm_name) or re.match(r"^[A-Za-z]{1,6}(\.[A-Za-z]+)?$", llm_name):
+    if re.match(r"^\d{6}(?:\.(?:SH|SZ|SS))?$", llm_name, re.IGNORECASE) or re.match(r"^[A-Za-z]{1,6}(\.[A-Za-z]+)?$", llm_name):
         symbol = _normalize_symbol(llm_name)
-        return symbol or None, llm_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
+        if symbol:
+            return symbol, llm_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
     local_code = await asyncio.to_thread(_search_cn_stock_by_name, llm_name)
     if local_code:
         return local_code, llm_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
     fallback = _normalize_symbol(llm_name)
-    if fallback:
+    if fallback and re.search(r"\d{6}|[A-Za-z]{2,}", fallback):
         return fallback, llm_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
+
+    # 最后兜底：LLM 返回了名字但所有 resolver 都解析不出，且 regex 找到了清晰代码
+    if fast_symbol:
+        _log(f"[StockExtract] LLM 名 '{llm_name}' 无法解析为代码，使用 regex 兜底: {fast_symbol}")
+        return fast_symbol, llm_date or fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
     return None, llm_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
@@ -2875,6 +2887,9 @@ def _ai_extract_symbol_and_date(
     import json as _json
 
     today = datetime.now().strftime("%Y-%m-%d")
+    # 兜底：先用 regex 直接从原文抽 symbol/date，LLM 失败 / 限流 / 返回 null 时
+    # 至少不会把用户已经明确输入的代码也判为"无法识别"。
+    fast_symbol, fast_date = _extract_symbol_and_date(text)
 
     llm_name: Optional[str] = None
     llm_date: Optional[str] = None
@@ -2940,16 +2955,20 @@ def _ai_extract_symbol_and_date(
         _log(f"[StockExtract] LLM failed: {e}")
 
     if not llm_name:
+        if fast_symbol:
+            _log(f"[StockExtract] LLM 未返回 stock_name，使用 regex 兜底: {fast_symbol}")
+            return fast_symbol, fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
         _log(f"[StockExtract] LLM returned no stock name for: '{text[:40]}'")
         return None, None, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
     _log(f"[StockExtract] LLM extracted name='{llm_name}', date={llm_date}, horizons={llm_horizons}")
 
     # ── Step 2: If looks like a direct code (digits / letters), normalize it ──
-    if re.match(r"^\d{6}$", llm_name) or re.match(r"^[A-Za-z]{1,6}(\.[A-Za-z]+)?$", llm_name):
+    if re.match(r"^\d{6}(?:\.(?:SH|SZ|SS))?$", llm_name, re.IGNORECASE) or re.match(r"^[A-Za-z]{1,6}(\.[A-Za-z]+)?$", llm_name):
         symbol = _normalize_symbol(llm_name)
-        _log(f"[StockExtract] Direct code: {symbol}")
-        return symbol or None, llm_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
+        if symbol:
+            _log(f"[StockExtract] Direct code: {symbol}")
+            return symbol, llm_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
     # ── Step 3: Search akshare A-share name database ──────────────────────────
     local_code = _search_cn_stock_by_name(llm_name)
@@ -2958,10 +2977,17 @@ def _ai_extract_symbol_and_date(
         return local_code, llm_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
     # ── Step 4: Last resort — treat LLM name as a raw code ────────────────────
+    # _normalize_symbol 在找不到代码时会原样返回，需要校验结果包含数字/英文，
+    # 避免把"天孚通讯"这种纯中文 LLM 输出当成 symbol 透传给 provider。
     fallback = _normalize_symbol(llm_name)
-    if fallback:
+    if fallback and re.search(r"\d{6}|[A-Za-z]{2,}", fallback):
         _log(f"[StockExtract] Fallback normalize: '{llm_name}' → {fallback}")
         return fallback, llm_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
+
+    # 最后兜底：LLM 给了名字但所有 resolver 都解析不出，且 regex 找到了清晰代码
+    if fast_symbol:
+        _log(f"[StockExtract] LLM 名 '{llm_name}' 无法解析为代码，使用 regex 兜底: {fast_symbol}")
+        return fast_symbol, llm_date or fast_date or today, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
 
     _log(f"[StockExtract] Could not resolve '{llm_name}' to a stock code")
     return None, llm_date, llm_horizons, llm_focus_areas, llm_specific_questions, llm_user_context
