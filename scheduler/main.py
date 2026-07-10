@@ -425,6 +425,14 @@ async def _startup():
     await asyncio.to_thread(_load_cn_stock_map)
     _log("Stock map pre-loaded on startup.")
 
+    # Global intraday concept-board anomaly scan — independent loop, own
+    # trading-hours clock, runs alongside (not instead of) the per-user
+    # scheduled-analysis loop below.
+    from scheduler.intraday import intraday_loop
+
+    _create_tracked_task(intraday_loop(), label="Intraday anomaly scan loop")
+    _log("[Intraday] anomaly scan task launched.")
+
     # Run the scheduler loop (blocks until cancelled)
     await _scheduler_loop()
 

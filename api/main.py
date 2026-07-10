@@ -39,7 +39,7 @@ from pydantic import BaseModel, Field, field_serializer
 from sqlalchemy.orm import Session
 import pandas as pd
 
-from api.database import UserDB, UserLLMConfigDB, VersionStatsDB, ReportDB, ImportedPortfolioPositionDB, FeedbackDB, SponsorDB, init_db, get_db, get_db_ctx
+from api.database import UserDB, UserLLMConfigDB, VersionStatsDB, ReportDB, ImportedPortfolioPositionDB, FeedbackDB, SponsorDB, IntradaySignalDB, init_db, get_db, get_db_ctx
 from api.job_store import get_job_store as _new_job_store
 from api.services import auth_service, portfolio_import_service, report_service, token_service, watchlist_service, scheduled_service, tracking_board_service, feedback_service, sponsor_service
 
@@ -713,6 +713,24 @@ class ReportDetailResponse(ReportResponse):
 class ReportListResponse(BaseModel):
     total: int
     reports: List[ReportResponse]
+
+
+class IntradaySignalItem(BaseModel):
+    id: str
+    trade_date: str
+    board_name: str
+    anomaly_case: str
+    change_pct: float
+    net_inflow: float
+    cause_summary: Optional[str] = None
+    fund_source: Optional[str] = None
+    judgement: Optional[str] = None
+    llm_failed: bool
+    created_at: str
+
+
+class IntradayFeedResponse(BaseModel):
+    items: List[IntradaySignalItem]
 
 
 class ReportBatchDeleteRequest(BaseModel):
@@ -4077,6 +4095,43 @@ def delete_from_watchlist(
 ):
     if not watchlist_service.delete_watchlist_item(db, current_user.id, item_id):
         raise HTTPException(404, "未找到该自选股")
+
+
+# ── Intraday Anomaly Feed ─────────────────────────────────────────────────────
+
+@app.get("/v1/intraday/feed", response_model=IntradayFeedResponse)
+def get_intraday_feed(
+    since_id: Optional[str] = None,
+    limit: int = 50,
+    current_user: UserDB = Depends(_require_api_user),
+    db: Session = Depends(get_db),
+):
+    """全局共享的盘中异动信息流（不分用户），按最新优先返回。"""
+    limit = max(1, min(limit, 200))
+    query = db.query(IntradaySignalDB)
+    if since_id:
+        since_row = db.query(IntradaySignalDB).filter(IntradaySignalDB.id == since_id).first()
+        if since_row is not None:
+            query = query.filter(IntradaySignalDB.created_at > since_row.created_at)
+    rows = query.order_by(IntradaySignalDB.created_at.desc()).limit(limit).all()
+    return IntradayFeedResponse(
+        items=[
+            IntradaySignalItem(
+                id=row.id,
+                trade_date=row.trade_date,
+                board_name=row.board_name,
+                anomaly_case=row.anomaly_case,
+                change_pct=row.change_pct,
+                net_inflow=row.net_inflow,
+                cause_summary=row.cause_summary,
+                fund_source=row.fund_source,
+                judgement=row.judgement,
+                llm_failed=row.llm_failed,
+                created_at=row.created_at.isoformat(),
+            )
+            for row in rows
+        ]
+    )
 
 
 # ── Scheduled Analysis ────────────────────────────────────────────────────────

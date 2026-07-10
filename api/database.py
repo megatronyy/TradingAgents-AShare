@@ -417,6 +417,23 @@ class ScheduledAnalysisDB(Base):
     __table_args__ = (UniqueConstraint('user_id', 'symbol', name='uq_scheduled_user_symbol'),)
 
 
+class IntradaySignalDB(Base):
+    """Intraday concept-board anomaly + LLM cause-attribution signal (global, not user-scoped)."""
+    __tablename__ = "intraday_signals"
+
+    id = Column(String(36), primary_key=True, index=True)
+    trade_date = Column(String(10), nullable=False, index=True)
+    board_name = Column(String(100), nullable=False)
+    anomaly_case = Column(String(1), nullable=False)  # A/B/C/D/E
+    change_pct = Column(Float, nullable=False)
+    net_inflow = Column(Float, nullable=False)
+    cause_summary = Column(Text, nullable=True)
+    fund_source = Column(String(20), nullable=True)  # 机构/游资/主力/不明
+    judgement = Column(String(20), nullable=True)     # 一日游/持续行情/主力提前布局
+    llm_failed = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
 class SponsorDB(Base):
     """Sponsor records managed by admin project."""
     __tablename__ = "sponsors"
