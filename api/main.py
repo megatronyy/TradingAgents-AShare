@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import socket
 import traceback
 from contextlib import asynccontextmanager
 from io import StringIO
@@ -33,7 +34,7 @@ load_dotenv()
 
 from fastapi import FastAPI, File, HTTPException, Depends, Query, Request, UploadFile, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_serializer
 from sqlalchemy.orm import Session
@@ -204,6 +205,12 @@ async def _run_manual_trigger(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize resources on startup and cleanup on shutdown."""
+    # 全局 socket 默认超时：akshare 等库内部的 requests 调用不传 timeout，
+    # 网络丢包时 TLS 握手/读会永久阻塞，僵尸线程逐渐占满线程池（见 healthz 探针）。
+    # uvicorn/asyncio 的服务端 socket 显式 setblocking(False)，不受此影响；
+    # httpx/openai SDK 自带超时配置，也不受影响。
+    socket.setdefaulttimeout(float(os.getenv("TA_SOCKET_DEFAULT_TIMEOUT", "60")))
+    _log(f"Global socket default timeout set to {socket.getdefaulttimeout()}s.")
     # Raise the AnyIO thread limiter ceiling so frequent sync endpoints
     # (tracking-board polling, /v1/jobs/{id} polling, akshare-backed
     # market endpoints) cannot starve each other when the event loop is
@@ -223,6 +230,7 @@ async def lifespan(app: FastAPI):
     # default is `min(32, cpu_count + 4)`, which is too small when many
     # `_run_job_inner` coroutines fan out concurrent `to_thread` calls for
     # DB writes, LLM extraction, and akshare data collection.
+    global _default_executor
     new_default_executor: Optional[ThreadPoolExecutor] = None
     try:
         loop = asyncio.get_running_loop()
@@ -232,6 +240,7 @@ async def lifespan(app: FastAPI):
             thread_name_prefix="ta-asyncio",
         )
         loop.set_default_executor(new_default_executor)
+        _default_executor = new_default_executor
         _log(f"Default asyncio executor set to {executor_workers} workers.")
     except Exception as exc:
         _log(f"Could not configure default asyncio executor: {exc}")
@@ -301,6 +310,8 @@ app.add_middleware(
 )
 
 _executor = ThreadPoolExecutor(max_workers=int(os.getenv("TA_MAX_WORKERS", "2")))
+# lifespan 中创建的 asyncio 默认 executor，healthz 探针用它报告饱和度
+_default_executor: Optional[ThreadPoolExecutor] = None
 
 # ── Singleton job store (in-memory or Redis depending on REDIS_URL) ─────────
 _job_store_instance: Optional[Any] = None
@@ -2463,8 +2474,24 @@ async def _stream_job_events(job_id: str):
 
 
 @app.get("/healthz")
-def healthz() -> Dict[str, str]:
-    return {"status": "ok"}
+async def healthz():
+    """健康检查，同时探测 asyncio 默认线程池是否被僵尸线程占满。
+
+    向默认 executor 提交一个 no-op，5 秒内排不上队即判定饱和并返回 503
+    （生产事故：无超时的网络调用把 64 个 worker 全部占死，所有依赖
+    to_thread 的接口静默挂起，前端表现为 Cloudflare 524）。
+    """
+    payload: Dict[str, Any] = {"status": "ok"}
+    if _default_executor is not None:
+        payload["executor_queued"] = _default_executor._work_queue.qsize()
+        payload["executor_threads"] = len(_default_executor._threads)
+    try:
+        loop = asyncio.get_running_loop()
+        await asyncio.wait_for(loop.run_in_executor(None, int), timeout=5)
+    except asyncio.TimeoutError:
+        payload["status"] = "thread_pool_starved"
+        return JSONResponse(status_code=503, content=payload)
+    return payload
 
 
 # Simple in-memory rate limiter for version stats: {ip: last_timestamp}
