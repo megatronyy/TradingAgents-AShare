@@ -5,7 +5,6 @@ import {
     FileText,
     LayoutDashboard,
     MessageSquare,
-    Radar,
     Settings,
     Wallet,
 } from 'lucide-react'
@@ -19,7 +18,6 @@ export interface SidebarNavItem {
 export const navItems: SidebarNavItem[] = [
     { path: '/', icon: LayoutDashboard, label: '控制台' },
     { path: '/analysis', icon: Activity, label: '智能分析' },
-    { path: '/intraday', icon: Radar, label: '盘中' },
     { path: '/reports', icon: FileText, label: '历史报告' },
     { path: '/portfolio', icon: Briefcase, label: '自选 & 定时' },
     { path: '/tracking-board', icon: Wallet, label: '跟踪看板' },
